@@ -1,0 +1,164 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// === CONFIGURACIÓN PINES RC522 ===
+#define RST_PIN 5      // Pin RST (cable rojo)
+#define SS_PIN 21      // Pin SDA/SS (cable marrón)
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+MFRC522::MIFARE_Key key;
+
+// ---- CONFIG WIFI ----
+const char* ssid = "Physical_none";
+const char* pass = "";
+
+// ---- URL DEL SERVIDOR ----
+String serverURL = "http://192.168.1.67:5000/registrar";
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("=== REGISTRADOR DE USUARIOS RFID ===");
+  
+  // Conexión WiFi
+  WiFi.begin(ssid, pass);
+  Serial.print("Conectando a WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nWiFi conectado!");
+  Serial.println("IP del ESP32:");
+  Serial.println(WiFi.localIP());
+  
+  // Inicializar RC522
+  SPI.begin();
+  mfrc522.PCD_Init();
+  
+  // Configurar clave por defecto
+  for (byte i = 0; i < 6; i++) {
+    key.keyByte[i] = 0xFF;
+  }
+  
+  Serial.println("RC522 listo.");
+  Serial.println("Acerque una tarjeta para registrar...");
+}
+
+void loop() {
+  // Buscar nuevas tarjetas
+  if (!mfrc522.PICC_IsNewCardPresent()) {
+    return;
+  }
+  
+  // Seleccionar tarjeta
+  if (!mfrc522.PICC_ReadCardSerial()) {
+    return;
+  }
+  
+  Serial.println("\n========================================");
+  Serial.println("Tarjeta detectada");
+  
+  // Convertir UID a string
+  String uidStr = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    uidStr += String(mfrc522.uid.uidByte[i]);
+  }
+  Serial.println("UID: " + uidStr);
+  
+  // ---- Solicitar datos por Serial ----
+  Serial.println("\n--- Ingresa los datos del usuario ---");
+  
+  Serial.print("Ingresa ID numérico: ");
+  while (!Serial.available()) {}
+  int id = Serial.parseInt();
+  Serial.println(id);
+  Serial.readStringUntil('\n');  // limpiar buffer
+  
+  Serial.print("Ingresa nombre: ");
+  while (!Serial.available()) {}
+  String nombre = Serial.readStringUntil('\n');
+  nombre.trim();
+  Serial.println(nombre);
+  
+  Serial.print("Ingresa rol: ");
+  while (!Serial.available()) {}
+  String rol = Serial.readStringUntil('\n');
+  rol.trim();
+  Serial.println(rol);
+  
+  // --- Grabar SOLO EL ID en la tarjeta (bloque 4) ---
+  byte block = 4;
+  MFRC522::StatusCode status;
+  
+  // Autenticar bloque 4
+  status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
+  
+  if (status != MFRC522::STATUS_OK) {
+    Serial.print("Error al autenticar: ");
+    Serial.println(mfrc522.GetStatusCodeName(status));
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    delay(3000);
+    return;
+  }
+  
+  // Preparar buffer con el ID (4 bytes little-endian)
+  byte buffer[16] = {0};
+  buffer[0] = id & 0xFF;
+  buffer[1] = (id >> 8) & 0xFF;
+  buffer[2] = (id >> 16) & 0xFF;
+  buffer[3] = (id >> 24) & 0xFF;
+  
+  // Escribir en el bloque 4
+  status = mfrc522.MIFARE_Write(block, buffer, 16);
+  
+  if (status == MFRC522::STATUS_OK) {
+    Serial.println("✓ ID guardado correctamente en la tarjeta!");
+  } else {
+    Serial.print("✗ ERROR al escribir ID en la tarjeta: ");
+    Serial.println(mfrc522.GetStatusCodeName(status));
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    delay(3000);
+    return;
+  }
+  
+  // --- Enviar datos al servidor ---
+  Serial.println("\nEnviando datos al servidor...");
+  
+  HTTPClient http;
+  http.begin(serverURL);
+  http.addHeader("Content-Type", "application/json");
+  
+  String payload = "{\"id\":" + String(id) +
+                   ",\"nombre\":\"" + nombre +
+                   "\",\"rol\":\"" + rol +
+                   "\",\"uid\":\"" + uidStr + "\"}";
+  
+  Serial.println("Payload:");
+  Serial.println(payload);
+  
+  int code = http.POST(payload);
+  Serial.print("Código HTTP: ");
+  Serial.println(code);
+  
+  if (code > 0) {
+    Serial.println("Respuesta del servidor:");
+    Serial.println(http.getString());
+  } else {
+    Serial.println("ERROR al enviar al servidor");
+    Serial.println(http.errorToString(code));
+  }
+  
+  http.end();
+  
+  // Detener comunicación con la tarjeta
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+  
+  Serial.println("========================================");
+  Serial.println("Usuario registrado. Puedes acercar otra tarjeta.\n");
+  
+  delay(3000);
+}

@@ -1,0 +1,147 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// === CONFIGURACIÓN PINES RC522 ===
+#define RST_PIN 5      // Pin RST (cable rojo)
+#define SS_PIN 21      // Pin SDA/SS (cable marrón)
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+MFRC522::MIFARE_Key key;
+
+// ---- CONFIG WIFI ----
+const char* ssid = "Physical_none";
+const char* pass = "";
+
+// ---- URL DEL SERVIDOR ----
+String serverURL = "http://192.168.1.67:5000/validar";
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("=== LECTOR RFID PARA VALIDACIÓN ===");
+  
+  // Conectar WiFi
+  WiFi.begin(ssid, pass);
+  Serial.print("Conectando a WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nWiFi conectado!");
+  Serial.println("IP del ESP32:");
+  Serial.println(WiFi.localIP());
+  
+  // Inicializar RC522
+  SPI.begin();
+  mfrc522.PCD_Init();
+  
+  // Configurar clave por defecto
+  for (byte i = 0; i < 6; i++) {
+    key.keyByte[i] = 0xFF;
+  }
+  
+  Serial.println("RC522 listo.");
+  Serial.println("Acerca una tarjeta para validar...");
+}
+
+void loop() {
+  // Buscar nuevas tarjetas
+  if (!mfrc522.PICC_IsNewCardPresent()) {
+    return;
+  }
+  
+  // Seleccionar tarjeta
+  if (!mfrc522.PICC_ReadCardSerial()) {
+    return;
+  }
+  
+  Serial.println("\n========================================");
+  Serial.println("Tarjeta detectada");
+  
+  // Convertir UID a String
+  String uidStr = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    uidStr += String(mfrc522.uid.uidByte[i]);
+  }
+  Serial.println("UID: " + uidStr);
+  
+  // --- Leer bloque 4 para obtener ID ---
+  byte block = 4;
+  MFRC522::StatusCode status;
+  
+  // Autenticar bloque 4
+  status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
+  
+  if (status != MFRC522::STATUS_OK) {
+    Serial.print("Error al autenticar: ");
+    Serial.println(mfrc522.GetStatusCodeName(status));
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    delay(2000);
+    return;
+  }
+  
+  // Leer el bloque 4
+  byte buffer[18];
+  byte size = sizeof(buffer);
+  status = mfrc522.MIFARE_Read(block, buffer, &size);
+  
+  if (status == MFRC522::STATUS_OK) {
+    // Extraer ID (4 bytes little-endian)
+    int id_leido = buffer[0] |
+                   (buffer[1] << 8) |
+                   (buffer[2] << 16) |
+                   (buffer[3] << 24);
+    
+    Serial.print("ID leído de la tarjeta: ");
+    Serial.println(id_leido);
+    
+    // ---- Enviar datos al servidor ----
+    Serial.println("\nValidando con el servidor...");
+    
+    HTTPClient http;
+    http.begin(serverURL);
+    http.addHeader("Content-Type", "application/json");
+    
+    String payload = "{\"id\":" + String(id_leido) +
+                     ",\"uid\":\"" + uidStr + "\"}";
+    
+    Serial.println("Payload:");
+    Serial.println(payload);
+    
+    int code = http.POST(payload);
+    Serial.print("Código HTTP: ");
+    Serial.println(code);
+    
+    if (code > 0) {
+      String respuesta = http.getString();
+      Serial.println("Respuesta del servidor:");
+      Serial.println(respuesta);
+      
+      // Indicar visualmente si fue exitoso
+      if (code == 200) {
+        Serial.println("✓ ACCESO AUTORIZADO");
+      } else {
+        Serial.println("✗ ACCESO DENEGADO");
+      }
+    } else {
+      Serial.println("ERROR al enviar al servidor");
+      Serial.println(http.errorToString(code));
+    }
+    
+    http.end();
+  } else {
+    Serial.print("ERROR al leer el bloque 4: ");
+    Serial.println(mfrc522.GetStatusCodeName(status));
+  }
+  
+  // Detener comunicación con la tarjeta
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+  
+  Serial.println("========================================");
+  Serial.println("Listo. Acerca otra tarjeta.\n");
+  
+  delay(2000);
+}
